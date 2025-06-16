@@ -27,6 +27,10 @@ ChatService::ChatService() {
                            [this](const TcpConnectionPtr &con, json js, Timestamp t) { AddGroup(con, js, t); });
   msg_handler_map_.emplace(static_cast<int>(EnMsgType::GROUP_CHAT_MSG),
                            [this](const TcpConnectionPtr &con, json js, Timestamp t) { GroupChat(con, js, t); });
+
+  if (redis_.connect()) {
+    redis_.init_notify_handler([this](int channel, string message) { HandleRedisSubscribeMessage(channel, message); });
+  }
 }
 
 MsgHandler ChatService::GetHandler(int msg_id) {
@@ -54,6 +58,8 @@ void ChatService::ClientCloseException(const TcpConnectionPtr &con) {
       }
     }
   }
+  // 取消订阅redis频道
+  redis_.unsubscribe(user.getId());
 
   // 更新状态
   if (user.getId() != -1) {
@@ -86,6 +92,9 @@ void ChatService::Login(const TcpConnectionPtr &con, json js, Timestamp t) {
         std::unique_lock<std::mutex> lock(mutex_);
         usr_connections_[id] = con;
       }
+
+      // id用户登录，订阅redis频道
+      redis_.subscribe(id);
 
       user_model_.updateState(user);
       json response;
@@ -179,10 +188,16 @@ void ChatService::OneChat(const TcpConnectionPtr &con, json js, Timestamp t) {
   {
     std::unique_lock<std::mutex> lock(mutex_);
     if (usr_connections_.count(toid) != 0U) {
-      // 在线 转发消息给toid用户
+      // 同服务器在线 转发消息给toid用户
       usr_connections_[toid]->send(js.dump());
       return;
     }
+  }
+  User user = user_model_.query(toid);
+  if (user.getState() == "online") {
+    // 在另一台服务器，publish消息到redis频道
+    redis_.publish(toid, js.dump());
+    return;
   }
   // 存储离线信息
   offline_msg_model_.insert(toid, js.dump());
@@ -225,8 +240,14 @@ void ChatService::GroupChat(const TcpConnectionPtr &con, json js, Timestamp t) {
       // 转发群消息
       usr_connections_[id]->send(js.dump());
     } else {
-      // 存储离线消息
-      offline_msg_model_.insert(id, js.dump());
+      User user = user_model_.query(id);
+      if (user.getState() == "online") {
+        // 在另一台服务器，publish消息到redis频道
+        redis_.publish(id, js.dump());
+      } else {
+        // 存储离线消息
+        offline_msg_model_.insert(id, js.dump());
+      }
     }
   }
 }
@@ -240,6 +261,7 @@ void ChatService::LoginOut(const TcpConnectionPtr &con, json js, Timestamp t) {
       usr_connections_.erase(id);
     }
   }
+  redis_.unsubscribe(id);
   User user;
   user.setId(id);
   user.setState("offline");
@@ -248,4 +270,16 @@ void ChatService::LoginOut(const TcpConnectionPtr &con, json js, Timestamp t) {
   json response;
   response["msgid"] = static_cast<int>(EnMsgType::LOGINOUT_MSG);
   con->send(response.dump());
+}
+
+// 收到订阅消息时的回调函数
+void ChatService::HandleRedisSubscribeMessage(int channel, string message) {
+  json js = json::parse(message.c_str());
+  std::unique_lock<std::mutex> lock(mutex_);
+  if (usr_connections_.count(channel) != 0) {
+    usr_connections_[channel]->send(js.dump());
+  } else {
+    // 离线用户，存储离线消息
+    offline_msg_model_.insert(channel, js.dump());
+  }
 }

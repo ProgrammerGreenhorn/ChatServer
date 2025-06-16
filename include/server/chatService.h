@@ -15,6 +15,7 @@
 #include "./model/userModel.h"
 #include "model/friendModel.h"
 #include "model/groupModel.h"
+#include "redis/redis.h"
 using namespace muduo::net;
 using namespace muduo;
 using json = nlohmann::json;
@@ -47,7 +48,11 @@ class ChatService {
   // 群组聊天
   void GroupChat(const TcpConnectionPtr &con, json js, Timestamp t);
 
+  // 注销
   void LoginOut(const TcpConnectionPtr &con, json js, Timestamp t);
+
+  // 处理redis订阅消息
+  void HandleRedisSubscribeMessage(int channel, string message);
 
   // 获取消息对应的处理器
   MsgHandler GetHandler(int msg_id);
@@ -79,6 +84,9 @@ class ChatService {
 
   GroupModel group_model_;
   /* end of 数据操作类对象 */
+
+  // redis
+  Redis redis_;
 };
 
 #endif
